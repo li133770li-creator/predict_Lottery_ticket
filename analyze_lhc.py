@@ -19,8 +19,14 @@ import csv
 from bs4 import BeautifulSoup
 
 DATA_HTML_PATH = os.path.join("data", "kj_index.html")
+# Optional extra pages for extended history
+DATA_HTML_EXTRA = [
+    os.path.join("data", "kj_2024.html"),
+    os.path.join("data", "kj_2023.html"),
+]
 PARSED_CSV_PATH = os.path.join("data", "parsed_draws.csv")
 REPORT_PATH = os.path.join("data", "analysis_report_001_285.md")
+REPORT_500_PATH = os.path.join("data", "analysis_report_last500.md")
 
 # Configurable parameters
 NUMBERS_RANGE = range(1, 50)  # Mark Six numbers 1..49
@@ -106,6 +112,24 @@ def parse_draws_from_html(html_path: str) -> List[Dict[str, Any]]:
     # 按期号升序，便于按时间序列分析
     result.sort(key=lambda x: x["issue"])
     return result
+
+
+def parse_draws_from_multiple(html_paths: List[str]) -> List[Dict[str, Any]]:
+    """Parse multiple HTML pages with the same structure and merge.
+    Deduplicate by (issue, date, zms, tm) if overlapping.
+    """
+    merged: List[Dict[str, Any]] = []
+    for p in html_paths:
+        if p and os.path.exists(p):
+            merged.extend(parse_draws_from_html(p))
+    # sort and deduplicate by issue
+    merged.sort(key=lambda x: (x["issue"], x.get("date") or ""))
+    dedup: Dict[int, Dict[str, Any]] = {}
+    for d in merged:
+        dedup[d["issue"]] = d
+    out = list(dedup.values())
+    out.sort(key=lambda x: x["issue"])
+    return out
 
 
 def save_draws_to_csv(draws: List[Dict[str, Any]], csv_path: str) -> None:
@@ -216,7 +240,7 @@ def last_seen_index(seq: List[int], value: int) -> Optional[int]:
 
 
 def predict_tm_286(draws: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """根据滑窗频率与交替特性给出 286 期 特码预测。"""
+    """根据滑窗频率与交替特性给出 286 期 特码预测（针对给定序列的下一期）。"""
     if not draws:
         raise ValueError("无数据，无法预测。")
 
@@ -321,6 +345,91 @@ def predict_tm_286(draws: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"prediction": prediction, "detail": detail}
 
 
+def predict_tm_ranking(draws: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """生成下一期特码候选排序（包含分数与交替详情）。"""
+    if not draws:
+        raise ValueError("无数据，无法预测。")
+
+    classes = classify_tm_within_window(draws, ALT_WINDOW)
+    alt_count, alt_ops, alt_rate = compute_alternation_rate(classes)
+    last_idx = len(draws) - 1
+    last_class = classes[last_idx]
+
+    if last_class in ("HOT", "COLD"):
+        expected_class = "COLD" if (alt_rate >= 0.5 and last_class == "HOT") else (
+            "HOT" if (alt_rate >= 0.5 and last_class == "COLD") else last_class
+        )
+    else:
+        expected_class = "HOT"
+
+    start_idx = max(0, len(draws) - RECENT_WINDOW_FOR_FREQ)
+    tm_recent = [d["tm"] for d in draws[start_idx:]]
+    tm_freq_recent = Counter(tm_recent)
+    for n in NUMBERS_RANGE:
+        _ = tm_freq_recent[n]
+
+    if expected_class == "HOT":
+        candidates = [n for n, _ in top_n(tm_freq_recent, HOT_COUNT)]
+    else:
+        recent_seq_full = [d["tm"] for d in draws]
+        def cold_key(n: int) -> Tuple[int, int]:
+            freq = tm_freq_recent[n]
+            last_idx_seen = last_seen_index(recent_seq_full, n)
+            gap = (len(recent_seq_full) - 1 - last_idx_seen) if last_idx_seen is not None else len(recent_seq_full)
+            return (freq, -gap)
+        sorted_by_cold = sorted(NUMBERS_RANGE, key=cold_key)
+        candidates = sorted_by_cold[:COLD_COUNT]
+
+    last_tm = draws[-1]["tm"]
+    candidates = [n for n in candidates if n != last_tm] or candidates
+
+    recent_seq_full = [d["tm"] for d in draws]
+    freq_values = [tm_freq_recent[n] for n in candidates]
+    gaps = []
+    for n in candidates:
+        li = last_seen_index(recent_seq_full, n)
+        gap = (len(recent_seq_full) - 1 - li) if li is not None else len(recent_seq_full)
+        gaps.append(gap)
+
+    def zscore(values: List[float]) -> List[float]:
+        if len(values) <= 1:
+            return [0.0 for _ in values]
+        mu = statistics.mean(values)
+        sd = statistics.pstdev(values) or 1.0
+        return [(v - mu) / sd for v in values]
+
+    freq_z = zscore(freq_values)
+    gap_z = zscore(gaps)
+    scores: List[float] = []
+    for i in range(len(candidates)):
+        if expected_class == "HOT":
+            s = 1.0 * freq_z[i] + 0.2 * gap_z[i]
+        else:
+            s = 1.0 * gap_z[i] - 0.2 * freq_z[i]
+        scores.append(s)
+
+    ranked = sorted(zip(candidates, scores, freq_values, gaps), key=lambda x: -x[1])
+
+    return {
+        "ranked": [
+            {
+                "number": n,
+                "score": round(s, 4),
+                "recent_freq": int(f),
+                "gap_since_last_tm": int(g),
+            }
+            for n, s, f, g in ranked
+        ],
+        "last_issue": draws[-1]["issue"],
+        "last_tm": draws[-1]["tm"],
+        "last_class": last_class,
+        "expected_class": expected_class,
+        "alternations": alt_count,
+        "opportunities": alt_ops,
+        "alt_rate": alt_rate,
+    }
+
+
 def render_report(draws: List[Dict[str, Any]], freqs: Dict[str, Counter], prediction: Dict[str, Any]) -> str:
     issues = [d["issue"] for d in draws]
     dates = [d.get("date") for d in draws if d.get("date")]
@@ -371,8 +480,24 @@ def render_report(draws: List[Dict[str, Any]], freqs: Dict[str, Counter], predic
     return "\n".join(lines) + "\n"
 
 
+def analyze_last_500(draws_full: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Counter]]:
+    if len(draws_full) > 500:
+        subset = draws_full[-500:]
+    else:
+        subset = draws_full[:]
+    freqs = compute_frequencies(subset)
+    return subset, freqs
+
+
+def tm_top_k(freqs_tm: Counter, k: int = 12) -> List[Tuple[int, int]]:
+    return sorted(freqs_tm.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+
+
 def main() -> None:
-    draws = parse_draws_from_html(DATA_HTML_PATH)
+    # Primary page
+    draws_index = parse_draws_from_html(DATA_HTML_PATH)
+    # Merge with extra year pages if present
+    draws = parse_draws_from_multiple([DATA_HTML_PATH] + DATA_HTML_EXTRA)
     if not draws:
         raise RuntimeError("解析失败：未提取到任何期次！请检查 data/kj_index.html 页面结构是否变化。")
 
@@ -389,6 +514,26 @@ def main() -> None:
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(report)
 
+    # Extended analysis over last 500 draws (if available)
+    draws500, freqs500 = analyze_last_500(draws)
+    # Save dedicated report
+    hot12_tm_500 = tm_top_k(freqs500["tm"], 12)
+    hot12_all_500 = top_n(freqs500["all"], 12)
+    cold12_all_500 = bottom_n(freqs500["all"], 12)
+    report500_lines = [
+        "### 最近500期 概览",
+        f"- **样本期数**: {len(draws500)} (期号 {draws500[0]['issue']} 至 {draws500[-1]['issue']})",
+        "\n### 最近500期 号码频次",
+        "- **特码 Top12**",
+    ]
+    report500_lines += [f"  - {n}: {c} 次" for n, c in hot12_tm_500]
+    report500_lines += ["\n- **综合(正+特) Top12**"]
+    report500_lines += [f"  - {n}: {c} 次" for n, c in hot12_all_500]
+    report500_lines += ["\n- **综合(正+特) 冷门 Bottom12**"]
+    report500_lines += [f"  - {n}: {c} 次" for n, c in cold12_all_500]
+    with open(REPORT_500_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(report500_lines) + "\n")
+
     # 控制台简报
     print(json.dumps({
         "parsed_issues": [draws[0]["issue"], draws[-1]["issue"]],
@@ -397,7 +542,9 @@ def main() -> None:
         "alt_rate": pred["detail"]["alt_rate"],
         "expected_class": pred["detail"]["expected_class"],
         "report_path": REPORT_PATH,
+        "report_500_path": REPORT_500_PATH,
         "parsed_csv": PARSED_CSV_PATH,
+        "tm_top12_last500": tm_top_k(freqs500["tm"], 12),
     }, ensure_ascii=False, indent=2))
 
 
