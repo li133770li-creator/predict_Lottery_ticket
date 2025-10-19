@@ -245,6 +245,16 @@ def pick_tm(picks):
             best = (score, n)
     return best[1] if best else picks[0]
 
+def zodiac_from_results(n):
+    # Try zero-padded match first
+    m = re.search(rf"<dt class=\"ball-(?:red|green|blue)\">\s*{n:02d}\s*</dt>\s*<dd>([^<])", kj_html)
+    if not m:
+        m = re.search(rf"<dt class=\"ball-(?:red|green|blue)\">\s*{n}\s*</dt>\s*<dd>([^<])", kj_html)
+    if m:
+        return m.group(1)
+    # Fallback to zodiac table mapping if available
+    return num_to_zodiac.get(n, '')
+
 strategies = [
     ("频率平衡预测", freq_balanced),
     ("遗漏值预测", omission_picks),
@@ -256,5 +266,5 @@ strategies = [
 
 for name, picks in strategies:
     tm = pick_tm(picks)
-    zx = num_to_zodiac.get(tm, '')
+    zx = zodiac_from_results(tm)
     print(f"{name} 特码: {tm} ({zx})  推荐: {picks}")
