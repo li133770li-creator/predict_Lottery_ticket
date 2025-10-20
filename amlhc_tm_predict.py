@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 RAW_DIR = os.path.join("data","amlhc","raw")
 KJ_PATH = os.path.join(RAW_DIR, "kj_2025.html")
 SX_PATH = os.path.join(RAW_DIR, "kj_sx.html")
+TMWX_PATH = os.path.join(RAW_DIR, "kj_tmwxzs_2025.html")
 TMSX_PATH = os.path.join(RAW_DIR, "kj_tmsxzs_2025.html")
 
 if not os.path.exists(KJ_PATH) or not os.path.exists(SX_PATH):
@@ -61,6 +62,14 @@ for cname, key in [("红波","red"),("蓝波","blue"),("绿波","green")]:
     if cm:
         for n in re.findall(r"(\d{1,2})", cm.group(1)):
             num_to_color[int(n)] = key
+
+# Five elements mapping from sx page tables
+num_to_element = {}
+for element in ["金","木","水","火","土"]:
+    sec = re.search(rf">{element}<.*?</td>\s*([\s\S]*?)</tr>", sx_html)
+    if sec:
+        for n in re.findall(r"(\d{1,2})", sec.group(1)):
+            num_to_element[int(n)] = element
 
 # Utility calculations
 
@@ -324,3 +333,42 @@ for name, picks in strategies:
     ranked = sorted(picks, key=lambda n: (-score_number(n), n))[:5]
     labels = [f"{n}({zodiac_from_results(n)})" for n in ranked]
     print(f"{name} TOP5: {labels}")
+
+# Five-elements Top3 per strategy for 293 (history-adjusted)
+def recent_tm_elements(last_n=50):
+    # Use parsed draws: take TM as the 7th number
+    sub = draws[-last_n:] if last_n < len(draws) else draws
+    cnt = Counter()
+    for _, nums in sub:
+        if len(nums) >= 7:
+            tmn = int(nums[6])
+            e = num_to_element.get(tmn, '')
+            if e:
+                cnt[e] += 1
+    return cnt
+
+def norm_dict(d):
+    if not d:
+        return {}
+    vmin = min(d.values())
+    vmax = max(d.values())
+    if abs(vmax - vmin) < 1e-9:
+        return {k: 0.5 for k in d}
+    return {k: (v - vmin) / (vmax - vmin) for k, v in d.items()}
+
+elem_recent = recent_tm_elements(50)
+elem_recent_n = norm_dict(elem_recent)
+
+print("五行TOP3 (历史走势+模型候选)")
+elements = ["金","木","水","火","土"]
+for name, picks in strategies:
+    # count elements in picks
+    picks_elem_cnt = Counter(num_to_element.get(n, '') for n in picks)
+    picks_elem_cnt.pop('', None)
+    picks_elem_n = norm_dict(picks_elem_cnt)
+    # combine score
+    scores = {}
+    for e in elements:
+        scores[e] = 0.7*elem_recent_n.get(e, 0.0) + 0.3*picks_elem_n.get(e, 0.0)
+    top3 = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:3]
+    print(f"{name} 五行TOP3: {[e for e,_ in top3]}")
