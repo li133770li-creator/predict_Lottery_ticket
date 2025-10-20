@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 RAW_DIR = os.path.join("data","amlhc","raw")
 KJ_PATH = os.path.join(RAW_DIR, "kj_2025.html")
 SX_PATH = os.path.join(RAW_DIR, "kj_sx.html")
+TMSX_PATH = os.path.join(RAW_DIR, "kj_tmsxzs_2025.html")
 
 if not os.path.exists(KJ_PATH) or not os.path.exists(SX_PATH):
     print("Missing required HTML files. Ensure data/amlhc/raw/kj_2025.html and kj_sx.html exist.")
@@ -268,3 +269,58 @@ for name, picks in strategies:
     tm = pick_tm(picks)
     zx = zodiac_from_results(tm)
     print(f"{name} 特码: {tm} ({zx})  推荐: {picks}")
+
+# If TM zodiac trend page exists, compute trend-adjusted TOP5 for each strategy
+def normalize(values_dict):
+    vals = list(values_dict.values())
+    if not vals:
+        return {k:0.0 for k in values_dict}
+    vmin, vmax = min(vals), max(vals)
+    if abs(vmax - vmin) < 1e-9:
+        return {k:0.5 for k in values_dict}
+    return {k:(v - vmin)/(vmax - vmin) for k, v in values_dict.items()}
+
+zx_recent = {z:0 for z in ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"]}
+if os.path.exists(TMSX_PATH):
+    try:
+        with open(TMSX_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+            tmsx_html = f.read()
+        # Extract rows and keep last 50 issues' zodiac (based on 'tema' cell position)
+        rows = []
+        for m in re.finditer(r"<tr>\s*<td>(\d{1,3})</td>([\s\S]*?)</tr>", tmsx_html):
+            issue = int(m.group(1))
+            cells = m.group(2)
+            tds = re.findall(r"<td[\s\S]*?>[\s\S]*?</td>", cells)
+            idx = None
+            for i, td in enumerate(tds):
+                if 'tema' in td:
+                    idx = i
+                    break
+            if idx is None:
+                continue
+            zodiac_order = ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"]
+            if 0 <= idx < len(zodiac_order):
+                rows.append((issue, zodiac_order[idx]))
+        rows.sort(key=lambda x: x[0])
+        last50 = [zx for _, zx in rows[-50:]]
+        for z in last50:
+            zx_recent[z] = zx_recent.get(z, 0) + 1
+    except Exception:
+        pass
+
+ema_norm = normalize({n: ema.get(n,0.0) for n in range(1,50)})
+om_norm = normalize({n: om.get(n,0) for n in range(1,50)})
+zx_norm = {}
+for n in range(1,50):
+    z = num_to_zodiac.get(n, '')
+    zx_norm[n] = zx_recent.get(z, 0)
+zx_norm = normalize(zx_norm)
+
+def score_number(n):
+    return 0.6*ema_norm.get(n,0.0) + 0.3*zx_norm.get(n,0.0) + 0.1*om_norm.get(n,0.0)
+
+print("TOP5 (趋势加权)")
+for name, picks in strategies:
+    ranked = sorted(picks, key=lambda n: (-score_number(n), n))[:5]
+    labels = [f"{n}({zodiac_from_results(n)})" for n in ranked]
+    print(f"{name} TOP5: {labels}")
